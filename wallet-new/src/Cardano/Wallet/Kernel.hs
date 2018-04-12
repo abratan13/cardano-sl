@@ -33,9 +33,9 @@ import qualified Data.List.NonEmpty as NE
 import           System.Wlog (Severity(..))
 
 import Cardano.Wallet.Kernel.Diffusion (WalletDiffusion(..))
-import Cardano.Wallet.Kernel.PrefilterTx (prefilterTxs, ourUtxo)
+import Cardano.Wallet.Kernel.PrefilterTx (prefilterTxs', ourUtxo')
 
-import Pos.Core (TxAux, HasConfiguration, sumCoins)
+import Pos.Core (TxAux, HasConfiguration, sumCoins, Address)
 import Pos.Core.Txp (TxIn (..), Tx (..), TxAux (..), TxOutAux (..), TxOut (..))
 import Cardano.Wallet.Kernel.Types (ResolvedBlock(..),
                                     ResolvedTx(..),
@@ -67,7 +67,8 @@ data State = State {
 data PassiveWallet = PassiveWallet {
       -- | Send log message
       _walletLogMessage :: Severity -> Text -> IO ()
-    , _walletESK :: EncryptedSecretKey -- TODO MVar [EncryptedSecretKey] or [esk + [State]]
+    , _walletESK :: EncryptedSecretKey  -- TODO MVar [EncryptedSecretKey] or [esk + [State]]
+    , _walletAddrs :: [Address]         -- Derived Addresses for this Wallet
     , _walletState :: State
     }
 
@@ -127,8 +128,9 @@ insertWalletPending ActiveWallet{..} tx
 bracketPassiveWallet :: (MonadMask m, MonadIO m)
                      => (Severity -> Text -> IO ())
                      -> EncryptedSecretKey
+                     -> [Address]
                      -> (PassiveWallet -> m a) -> m a
-bracketPassiveWallet _walletLogMessage _walletESK =
+bracketPassiveWallet _walletLogMessage _walletESK _walletAddrs =
     bracket
       (do
           _stateUtxo <- Universum.newMVar Map.empty
@@ -195,7 +197,7 @@ applyBlock w b = do
     pending <- getWalletPending w
     utxoBalance <- getWalletUtxoBalance w
 
-    let prefilteredTxs = prefilterTxs (w ^. walletESK) (rbTxs b)
+    let prefilteredTxs = prefilterTxs' (w ^. walletAddrs) (rbTxs b)
         (utxo', balanceDelta) = updateUtxo prefilteredTxs utxo
         pending'              = updatePending prefilteredTxs pending
         balance'              = balanceDelta + utxoBalance
@@ -286,7 +288,7 @@ change w = do
     pending' <- getWalletPending w
     let pendingUtxo = unionTxOuts $ map (txUtxo . taTx) $ Set.toList pending'
 
-    return $ ourUtxo (_walletESK w) pendingUtxo
+    return $ ourUtxo' (_walletAddrs w) pendingUtxo
 
 total :: PassiveWallet -> IO Utxo
 total w = Map.union <$> available w <*> change w

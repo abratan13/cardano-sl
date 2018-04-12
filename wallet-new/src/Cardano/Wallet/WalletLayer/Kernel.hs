@@ -24,10 +24,11 @@ bracketPassiveWallet
     => (Severity -> Text -> IO ())
     -> (PassiveWalletLayer n -> m a) -> m a
 bracketPassiveWallet logFunction f =
-    Kernel.bracketPassiveWallet logFunction esk $ \w -> do
+    Kernel.bracketPassiveWallet logFunction esk addrs $ \w -> do
                 f (passiveWalletLayer w)
   where
     esk = undefined -- TODO
+    addrs = [] -- TODO
 
     -- | TODO(ks): Currently not implemented!
     passiveWalletLayer :: forall n'. (MonadIO n', HasConfiguration)

@@ -28,7 +28,7 @@ import           Cardano.Wallet.Kernel.Types (ResolvedBlock(..))
 import           UTxO.BlockGen
 import           UTxO.Bootstrap
 import           UTxO.Context
-import           UTxO.DSL
+import           UTxO.DSL              as DSL
 import           UTxO.Interpreter
 import           UTxO.PreChain
 import           UTxO.Translate
@@ -89,7 +89,7 @@ dslToCardanoUtxo intCtxt dslUtxo = do
         Right (utxo', _) ->
             return utxo'
 
-dslToCardanoBlock :: IntCtxt GivenHash -> UTxO.DSL.Block GivenHash Addr -> ValidatedT ResolvedBlock
+dslToCardanoBlock :: IntCtxt GivenHash -> DSL.Block GivenHash Addr -> ValidatedT ResolvedBlock
 dslToCardanoBlock intCtxt b = do
     res <- catchTranslateErrors $ runIntT intCtxt chain
     case res of
@@ -100,7 +100,7 @@ dslToCardanoBlock intCtxt b = do
     where blocks = OldestFirst [b]
           chain = Chain blocks
 
-dslToCardanoTxAux :: IntCtxt GivenHash -> UTxO.DSL.Transaction GivenHash Addr -> ValidatedT TxAux
+dslToCardanoTxAux :: IntCtxt GivenHash -> DSL.Transaction GivenHash Addr -> ValidatedT TxAux
 dslToCardanoTxAux intCtxt t = do
     res <- catchTranslateErrors $ runIntT intCtxt t
     case res of
@@ -108,14 +108,27 @@ dslToCardanoTxAux intCtxt t = do
         Right (rawResolvedTx, _) ->
             return $ fst rawResolvedTx
 
-getFirstPoorActorESK :: C.EncryptedSecretKey
+poorActorESKAddrs :: Poor -> (C.EncryptedSecretKey, [Pos.Core.Address])
+poorActorESKAddrs poorActor
+    =  (encKpEnc rootEKP, [derivedAddress])
+    where
+        rootEKP = poorKey $ poorActor
+        -- Currently there is only one _derived_ EKP/address per Poor Actor
+        -- We use this (first and only) Address and discard the associated
+        -- derived EKP
+        (_, derivedAddress)
+            = fromJust . head $ poorAddrs poorActor
+
+getFirstPoorActorESK :: (C.EncryptedSecretKey, [Pos.Core.Address])
 getFirstPoorActorESK
     = runTranslateNoErrors $ asks getFirstPoorActorESK_
     where
-        getFirstPoorActorESK_ :: TransCtxt -> C.EncryptedSecretKey
+        getFirstPoorActorESK_ :: TransCtxt -> (C.EncryptedSecretKey, [Pos.Core.Address])
         getFirstPoorActorESK_ TransCtxt{..}
-            =  encKpEnc . poorKey . fromJust . head $ poorActors
-            where poorActors = Map.elems . actorsPoor $ tcActors
+            =  poorActorESKAddrs poorActor
+            where
+                poorActors = Map.elems . actorsPoor $ tcActors
+                poorActor = fromJust . head $ poorActors -- pick first Actor
 
 {-------------------------------------------------------------------------------
   UTxO->Cardano translation tests
@@ -329,16 +342,16 @@ interpret' cardanoW mkDSLWallet' pCheckEqual ind'
                            -- TODO create DSLError... generalise "ValidatedT e a"
 
 newtype InductiveWithCtxt
-    = InductiveWithCtxt (InductiveWithOurs GivenHash Addr,
-                         TransCtxt,
-                         C.EncryptedSecretKey)
+    = InductiveWithCtxt (InductiveWithOurs GivenHash Addr
+                        , C.EncryptedSecretKey
+                        , [Pos.Core.Address])
 
 testPureWallets :: HasConfiguration => Spec
 testPureWallets =
     it "Test pure wallets - compare DSL and Cardano Wallets after each Inductive step" $
-      forAll genInductive $ \(InductiveWithCtxt (ind, transCtxt, esk)) ->
-                                (bracketActiveWallet esk $ \cardanoW ->
-                                    checkEquivalent transCtxt cardanoW ind)
+      forAll genInductive $ \(InductiveWithCtxt (ind, esk, addrs)) ->
+                                (bracketActiveWallet esk addrs $ \cardanoW ->
+                                    checkEquivalent cardanoW ind)
 
   where
     genInductive :: Hash GivenHash Addr
@@ -349,25 +362,29 @@ testPureWallets =
                                     fpc' <- fromPreChain genValidBlockchain
                                     return (fpc',transCtxt')
 
+      -- Select a Poor Actor (from the translation Context)
+      -- and extract Root ESK and derived Addresses
       let poorActors = Map.elems . actorsPoor . tcActors $ transCtxt
       poorIx <- choose (0, length poorActors -1)
-      let esk =  encKpEnc . poorKey $ poorActors !! poorIx
+      let poorActor = poorActors !! poorIx
+          poorActorIx = (IxPoor poorIx)
+          (esk, addrs) = poorActorESKAddrs poorActor
 
-      ind <- genFromBlockchainWithOurs (ours' (IxPoor poorIx)) fpc
-      return $ InductiveWithCtxt (ind, transCtxt, esk)
+      ind <- genFromBlockchainWithOurs (ours' poorActorIx) fpc
+      return $ InductiveWithCtxt (ind, esk, addrs)
 
     ours' :: ActorIx -> Addr -> Bool
     ours' poorIx@(IxPoor _) addr = addrActorIx addr == poorIx
     ours' _ _ = False
 
     checkEquivalent :: HasConfiguration
-                    => TransCtxt
-                    -> Kernel.ActiveWallet
+                    => Kernel.ActiveWallet
                     -> InductiveWithOurs GivenHash Addr
                     -> Expectation
-    checkEquivalent transCtxt cardanoW (InductiveWithOurs addrs ind)
+    checkEquivalent cardanoW (InductiveWithOurs addrs ind)
         = do
-            res <- runTranslateT $
+            res <- runTranslateT $ do
+                      transCtxt <- ask
                       walletEquivalent' cardanoW (mkDSLWallet transCtxt addrs) ind
 
             shouldBe res ()
@@ -462,8 +479,11 @@ testPureWallet = do
 -------------------------------------------------------------------------------}
 
 -- | Initialize passive wallet in a manner suitable for the unit tests
-bracketPassiveWallet :: C.EncryptedSecretKey -> (Kernel.PassiveWallet -> IO a) -> IO a
-bracketPassiveWallet esk = Kernel.bracketPassiveWallet logMessage esk
+bracketPassiveWallet :: C.EncryptedSecretKey
+                     -> [Pos.Core.Address]
+                     -> (Kernel.PassiveWallet -> IO a)
+                     -> IO a
+bracketPassiveWallet esk addrs = Kernel.bracketPassiveWallet logMessage esk addrs
   where
    -- TODO: Decide what to do with logging
     logMessage _sev _txt = do
@@ -472,9 +492,9 @@ bracketPassiveWallet esk = Kernel.bracketPassiveWallet logMessage esk
       return ()
 
 -- | Initialize active wallet in a manner suitable for generator-based testing
-bracketActiveWallet :: C.EncryptedSecretKey -> (Kernel.ActiveWallet -> IO a) -> IO a
-bracketActiveWallet esk test =
-    (bracketPassiveWallet esk) $ \passive ->
+bracketActiveWallet :: C.EncryptedSecretKey -> [Pos.Core.Address] -> (Kernel.ActiveWallet -> IO a) -> IO a
+bracketActiveWallet esk addrs test =
+    (bracketPassiveWallet esk addrs) $ \passive ->
       Kernel.bracketActiveWallet passive diffusion $ \active ->
         test active
 
@@ -491,8 +511,8 @@ testActiveWallet = around bracketWallet $
 -- | Initialize active wallet in a manner suitable for unit testing
 bracketWallet :: (Kernel.ActiveWallet -> IO a) -> IO a
 bracketWallet test = do
-    let esk = getFirstPoorActorESK
-    (bracketPassiveWallet esk) $ \passive ->
+    let (esk, addrs) = getFirstPoorActorESK
+    (bracketPassiveWallet esk addrs) $ \passive ->
       Kernel.bracketActiveWallet passive diffusion $ \active ->
         test active
 
